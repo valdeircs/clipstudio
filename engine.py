@@ -333,6 +333,142 @@ def _json3(path: Path, duration: float) -> list[dict]:
     return _clean_segments(result, duration)
 
 
+WORD_PRECISION_NOTE = "Source word timings are used where available; untimed phrases retain caption-cue timing."
+CUE_PRECISION_NOTE = "Only caption-cue timings are available; exact sentence boundaries inside a cue cannot be inferred."
+
+
+def _has_word_timing(segments: list[dict]) -> bool:
+    from ai_ranker import _timed_words
+    for segment in segments:
+        words = _timed_words(segment, segment["start"], segment["end"])
+        if words and len({word["start"] for word in words}) > 1:
+            return True
+    return False
+
+
+def sentence_aligned_segments(segments: list[dict], duration: float) -> list[dict]:
+    """Regroup exact source text at available sentence/word boundaries.
+
+    Preserve every source-timed word or phrase. Rolling caption display ends
+    are capped at the next source onset, never interpolated into invented word
+    timings. A phrase without internal offsets remains a single timed atom.
+    """
+    from ai_ranker import _prepare_segments, _timed_words
+    cleaned = _clean_segments(segments, duration)
+    if not cleaned:
+        raise VideoError("Caption extraction did not return a usable timestamped transcript.")
+    units = _prepare_segments(cleaned, duration)
+    atoms = []
+    for segment in cleaned:
+        words = _timed_words(segment, segment["start"], segment["end"])
+        if words:
+            atoms.extend({**word, "timed": True} for word in words)
+        else:
+            atoms.append({"start": segment["start"], "end": segment["end"], "text": segment["text"], "timed": False})
+    for atom, following in zip(atoms, atoms[1:]):
+        if following["start"] > atom["start"]:
+            atom["end"] = min(atom["end"], following["start"])
+    result, cursor = [], 0
+    for unit in units:
+        members, parts = [], []
+        while cursor < len(atoms):
+            atom = atoms[cursor]
+            members.append(atom)
+            parts.append(atom["text"])
+            cursor += 1
+            joined = " ".join(parts)
+            if joined == unit["text"]:
+                break
+            if len(joined) >= len(unit["text"]):
+                raise VideoError("Caption text could not be aligned without changing the source words.")
+        if " ".join(parts) != unit["text"]:
+            raise VideoError("Caption text could not be aligned without changing the source words.")
+        item = {"start": unit["start"], "end": unit["end"], "text": unit["text"]}
+        if all(atom["timed"] for atom in members):
+            item["words"] = [{"start": atom["start"], "end": atom["end"], "word": atom["text"]} for atom in members]
+        result.append(item)
+    if cursor != len(atoms):
+        raise VideoError("Some caption words could not be aligned safely.")
+    return result
+
+
+def _select_caption_track(info: dict, language: str) -> tuple[str, bool] | None:
+    """Select one same-language JSON3 track, preferring original word timing."""
+    target = language.lower()
+    base = target.split("-")[0]
+    choices = []
+    for automatic, field in ((False, "subtitles"), (True, "automatic_captions")):
+        tracks = info.get(field) or {}
+        if not isinstance(tracks, dict):
+            continue
+        for key, formats in tracks.items():
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9-]{2,40}", key):
+                continue
+            original = key.lower().endswith("-orig")
+            locale = key.lower()[:-5] if original else key.lower()
+            if locale.split("-")[0] != base or not isinstance(formats, list):
+                continue
+            json3 = [fmt for fmt in formats if isinstance(fmt, dict) and fmt.get("ext") == "json3"]
+            if not json3:
+                continue
+            translated = all(bool(parse_qs(urlparse(str(fmt.get("url", ""))).query).get("tlang")) for fmt in json3)
+            choices.append(((not original, translated, automatic, locale != target, key), key, automatic))
+    if not choices:
+        return None
+    _, key, automatic = min(choices)
+    return key, automatic
+
+
+def _local_word_captions(folder: Path, url: str, language: str, info: dict, progress: Progress) -> dict | None:
+    """Fetch subtitles only, without media, transcription or any AI service."""
+    selected = _select_caption_track(info, language)
+    if selected is None:
+        return None
+    track, automatic = selected
+    duration = float(info["duration"])
+    video_id = parse_qs(urlparse(url).query)["v"][0]
+    prefix = f"captions-{video_id}"
+    caption_file = folder / f"{prefix}.{track}.json3"
+
+    def read_words():
+        try:
+            if not caption_file.is_file() or caption_file.stat().st_size > 25_000_000:
+                return None
+            segments = _json3(caption_file, duration)
+            if segments and _has_word_timing(segments):
+                return {"segments": segments, "language": language, "duration": duration,
+                        "transcript_origin": "Local YouTube captions (JSON3 source word timings)",
+                        "transcript_precision": "word", "transcript_precision_note": WORD_PRECISION_NOTE,
+                        "caption_track": track, "caption_automatic": automatic}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            pass
+        return None
+
+    cached = read_words()
+    if cached:
+        return cached
+    binary = _binary("yt-dlp")
+    if not binary:
+        return None
+    progress("transcript", 35, "Reading YouTube caption word timings without downloading the video…")
+    metadata_file = folder / f"caption-request-{uuid.uuid4().hex}.info.json"
+    try:
+        # Loading the already-fetched metadata avoids another video-page lookup.
+        metadata_file.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+        args = [binary, "--ignore-config", "--no-playlist", "--no-progress", "--socket-timeout", "20",
+                "--retries", "0", "--fragment-retries", "0", "--extractor-retries", "0", "--skip-download",
+                "--write-auto-subs" if automatic else "--write-subs",
+                "--no-write-subs" if automatic else "--no-write-auto-subs",
+                "--sub-langs", "^" + re.escape(track) + "$", "--sub-format", "json3",
+                "-o", prefix + ".%(ext)s", "--load-info-json", str(metadata_file.resolve())]
+        _run(args, folder, timeout=90, failure="YouTube word-timed captions were unavailable.")
+        return read_words()
+    except (VideoError, OSError, ValueError, TypeError):
+        return None
+    finally:
+        metadata_file.unlink(missing_ok=True)
+
+
 def _transcribe(folder: Path, source: Path, language: str, progress: Progress) -> tuple[list, str]:
     available = _models()
     if not available or not _binary("whisper"):
@@ -867,38 +1003,58 @@ def analyze_api_project(folder: Path, request: dict, progress: Progress) -> dict
         cached = json.loads(cached_file.read_text())
         if cached.get('url') == url and cached.get('language') == language:
             transcript = cached['result']
-    if transcript is None:
-        if pipeline == 'local_ai':
+    if pipeline == 'local_ai':
+        old_segments = _clean_segments(transcript.get('segments', []), duration) if transcript else []
+        if not old_segments or not _has_word_timing(old_segments):
+            precise = _local_word_captions(folder, url, language, info, progress)
+            if precise is not None:
+                transcript = precise
+        if transcript is None:
             from local_transcript import fetch_transcript as fetch_local_transcript
             transcript = fetch_local_transcript(url, language, progress)
-        else:
-            run_config = dict(config)
-            if request.get('apify_run_id'):
-                run_config['apify_run_id'] = request['apify_run_id']
+    elif transcript is None:
+        run_config = dict(config)
+        if request.get('apify_run_id'):
+            run_config['apify_run_id'] = request['apify_run_id']
+        try:
+            transcript = fetch_transcript(url, language, run_config, progress)
+        except ApifyError as exc:
+            actor = str(run_config.get('apify_actor') or DEFAULT_ACTOR).replace('~', '/')
+            if actor != OWNED_ACTOR or exc.code != 'REQUEST_BLOCKED':
+                raise
+            from local_transcript import fetch_transcript as fetch_local_transcript
             try:
-                transcript = fetch_transcript(url, language, run_config, progress)
-            except ApifyError as exc:
-                actor = str(run_config.get('apify_actor') or DEFAULT_ACTOR).replace('~', '/')
-                if actor != OWNED_ACTOR or exc.code != 'REQUEST_BLOCKED':
-                    raise
-                from local_transcript import fetch_transcript as fetch_local_transcript
-                try:
-                    transcript = fetch_local_transcript(url, language, progress, apify_blocked=True)
-                except Exception as local_error:
-                    local_error.run_id = exc.run_id
-                    raise
-                transcript['apify_run_id'] = exc.run_id
-        cached_file.write_text(json.dumps({'url': url, 'language': language, 'result': transcript}, ensure_ascii=False), encoding='utf-8')
-    segments = _clean_segments(transcript['segments'], duration)
-    if not segments:
+                transcript = fetch_local_transcript(url, language, progress, apify_blocked=True)
+            except Exception as local_error:
+                local_error.run_id = exc.run_id
+                raise
+            transcript['apify_run_id'] = exc.run_id
+    raw_segments = _clean_segments(transcript['segments'], duration)
+    if not raw_segments:
         raise VideoError('Caption extraction did not return a usable timestamped transcript.')
+    has_words = _has_word_timing(raw_segments)
+    precision = 'word' if has_words else 'cue'
+    precision_note = WORD_PRECISION_NOTE if has_words else CUE_PRECISION_NOTE
+    segments = sentence_aligned_segments(raw_segments, duration)
+    transcript = {**transcript, 'segments': raw_segments,
+                  'transcript_precision': precision, 'transcript_precision_note': precision_note}
+    cached_file.write_text(json.dumps({'url': url, 'language': language, 'result': transcript}, ensure_ascii=False), encoding='utf-8')
     _write_srt(folder / 'transcript.srt', segments)
     (folder / 'transcript.txt').write_text('\n'.join(s['text'] for s in segments), encoding='utf-8')
     (folder / 'transcript.json').write_text(json.dumps({'segments': segments, 'language': language}, ensure_ascii=False), encoding='utf-8')
+    metadata = {'title': str(info.get('title') or 'YouTube video')[:200], 'duration': duration,
+                'language': language, 'source_url': url, 'segments': segments, 'pipeline': pipeline,
+                'transcript': 'transcript.txt', 'transcript_srt': 'transcript.srt',
+                'transcript_origin': transcript.get('transcript_origin', 'Local YouTube captions' if pipeline == 'local_ai' else 'Apify'),
+                'transcript_precision': precision, 'transcript_precision_note': precision_note,
+                'apify_run_id': transcript.get('apify_run_id')}
+    observer = request.get('_transcript_observer')
+    if callable(observer):
+        observer(json.loads(json.dumps(metadata, ensure_ascii=False)))
     progress('ai', 70, f"{config.get('ai_provider', 'Gemini').title()} is checking hooks, context and complete thoughts…")
     result = rank_with_ai(segments, duration, {**request, 'language': language}, config)
     progress('ready', 100, 'AI suggestions are ready. The source video downloads when you render your first clip.')
-    return {**result, 'title': str(info.get('title') or 'YouTube video')[:200], 'duration': duration, 'language': language, 'source': None, 'source_url': url, 'segments': segments, 'pipeline': pipeline, 'transcript': 'transcript.txt', 'transcript_srt': 'transcript.srt', 'transcript_origin': transcript.get('transcript_origin', 'Local YouTube captions' if pipeline == 'local_ai' else 'Apify'), 'apify_run_id': transcript.get('apify_run_id')}
+    return {**result, **metadata, 'source': None}
 
 
 def ensure_media(folder: Path, project: dict, progress: Progress) -> dict:

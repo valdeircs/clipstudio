@@ -37,14 +37,16 @@ function schedulePoll(){clearTimeout(state.poll);if(!isBusy(state.current))retur
 function renderProject(){
   state.view='project';const p=state.current;if(!p)return;renderNav();$('#breadcrumb').textContent='Project';
   const clips=p.clips||[];if(!clips.some(c=>c.id===state.selected))state.selected=clips[0]?.id;
-  const busy=isBusy(p),progress=p.progress||{},canReselect=(p.segments||[]).length>0&&state.connections?.ai_connected,selection=selectionDraftFor(p);
+  const busy=isBusy(p),progress=p.progress||{},hasTranscript=(p.segments||[]).length>0,canReselect=hasTranscript&&state.connections?.ai_connected,selection=selectionDraftFor(p);
+  if(!clips.length&&hasTranscript)state.tab='transcript';
   $('#page').innerHTML=`<div class="project-heading"><div><div class="eyebrow">${p.source_kind==='demo'?'EXAMPLE PROJECT':'YOUR VIDEO'}</div><h1 class="project-title">${esc(p.title||'Importing your video…')}</h1><div class="meta">${p.duration?`<span>${time(p.duration)} source video</span>`:''}${p.language?`<span>${esc(p.language.toUpperCase())}</span>`:''}${clips.length?`<span>${clips.length} suggested ${clips.length===1?'moment':'moments'}</span>`:''}<span>Local workspace</span>${p.ai_provider?`<span class="selection-goal-meta">${esc(messageGoals.find(([id])=>id===(p.settings?.message_goal||p.message_goal||'balanced'))?.[1]||'Best complete moments')}${(p.settings?.content_context||p.content_context)==='church'?' · Church / faith':''}</span>`:''}</div></div><button class="outline" id="backHome">${icon('plus',13)}New video</button></div>
   ${busy?`<div class="progress-box" role="status"><div class="progress-title"><span>${esc(stageLabel(progress.stage,p.status))}</span><span class="spinner"></span></div><div class="progress-track"><i style="width:${Math.max(2,Math.min(100,Number(progress.percent)||0))}%"></i></div><p>${esc(progress.message||'Your video is being processed on this Mac…')}</p></div>`:''}
   ${!busy&&p.error?`<div class="issue" style="margin-top:25px" role="alert">${esc(p.error)}</div>`:''}
   ${!busy&&p.coverage_note?`<p class="coverage-note">${esc(p.coverage_note)}</p>`:''}
   ${!busy&&canReselect?`<div class="reselect-panel"><div><strong>Let Gemini choose a complete moment</strong><p>AI decides each start and end within 30–90 seconds using your transcript. One AI request; your Google account usage applies.</p></div><div class="reselect-actions"><div class="reselect-preferences"><div><label for="reselectGoal">Message goal</label><select id="reselectGoal">${selectionOptions(messageGoals,selection.message_goal)}</select></div><div><label for="reselectContext">Content context</label><select id="reselectContext">${selectionOptions(contentContexts,selection.content_context)}</select></div><div><label for="reselectCount">Suggestions</label><select id="reselectCount">${[3,5,8].map(count=>`<option value="${count}" ${selection.count===count?'selected':''}>${count} clips</option>`).join('')}</select></div></div><button class="primary" id="reselectAI">Reselect with Gemini ${icon('arrow',14)}</button></div></div>`:''}
-  ${!busy&&clips.length?`<div class="tabs"><button class="tab ${state.tab==='clips'?'active':''}" data-tab="clips">Your clips <span>${clips.length}</span></button><button class="tab ${state.tab==='transcript'?'active':''}" data-tab="transcript">Full transcript</button></div><div id="projectContent"></div>`:''}
-  ${!busy&&!clips.length&&p.status!=='error'?'<div class="progress-box"><p>No spoken moments were found. Try a video with clear speech.</p></div>':''}`;
+  ${!busy&&!clips.length&&hasTranscript?'<div class="progress-box"><p>Your transcript is ready. No clips have been selected yet.</p></div>':''}
+  ${!busy&&(clips.length||hasTranscript)?`<div class="tabs">${clips.length?`<button class="tab ${state.tab==='clips'?'active':''}" data-tab="clips">Your clips <span>${clips.length}</span></button>`:''}<button class="tab ${state.tab==='transcript'?'active':''}" data-tab="transcript">Full transcript</button></div><div id="projectContent"></div>`:''}
+  ${!busy&&!clips.length&&!hasTranscript&&p.status!=='error'?'<div class="progress-box"><p>No spoken moments were found. Try a video with clear speech.</p></div>':''}`;
   $('#backHome').onclick=showHome;
   if($('#reselectCount'))$('#reselectCount').onchange=e=>{selection.count=Number(e.target.value)};
   if($('#reselectGoal'))$('#reselectGoal').onchange=e=>{selection.message_goal=e.target.value};
@@ -54,7 +56,7 @@ function renderProject(){
     try{state.current=await api(`/api/projects/${p.id}/reselect-ai`,{count:Number($('#reselectCount').value),message_goal:$('#reselectGoal').value,content_context:$('#reselectContext').value});renderProject();schedulePoll()}
     catch(e){toast(e.message);button.disabled=false}
   };
-  if(busy||!clips.length)return;
+  if(busy||(!clips.length&&!hasTranscript))return;
   document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{state.tab=b.dataset.tab;renderProject()});
   if(state.tab==='transcript')renderTranscript(p);else renderClips(p);
 }

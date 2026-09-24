@@ -204,7 +204,17 @@ def analyze_job(project_id: str, request: dict) -> None:
     secrets = tuple(value for key, value in snapshot.items() if key in SECRET_FIELDS and isinstance(value, str))
     update_project(project_id, lambda p: p.update(status="analyzing", error=None))
     try:
-        result = engine().analyze_project(project_folder(project_id), request, progress_callback(project_id, secrets=secrets))
+        def transcript_ready(metadata):
+            # Extraction succeeds independently of AI ranking. Keep its result
+            # reviewable even when the provider rejects a later selection.
+            fields = {"title", "duration", "language", "source_url", "segments", "pipeline",
+                      "transcript", "transcript_srt", "transcript_origin", "transcript_precision", "transcript_precision_note", "apify_run_id"}
+            safe = redact({key: value for key, value in metadata.items() if key in fields}, secrets)
+            update_project(project_id, lambda p: p.update(safe))
+        observed_request = {**request, "_transcript_observer": transcript_ready,
+                            "_response_observer": lambda response: atomic_json(
+                                project_folder(project_id) / "ai-selection-response.json", redact(response, secrets))}
+        result = engine().analyze_project(project_folder(project_id), observed_request, progress_callback(project_id, secrets=secrets))
         if not isinstance(result, dict):
             raise RuntimeError("The video analysis did not return a project.")
         def complete(project):
@@ -222,7 +232,8 @@ def analyze_job(project_id: str, request: dict) -> None:
         log_failure(project_id, "Analysis", secrets)
         message = redact(error_message(exc, "Analysis failed. Check the video and installed tools, then try analysis again."), secrets)
         def failed(project):
-            project.update(status="error", error=message, progress={"stage": "error", "percent": 0, "message": message})
+            detail = message + " Your transcript is saved and can be reviewed or used to select clips again." if project.get("segments") else message
+            project.update(status="error", error=detail, progress={"stage": "error", "percent": 0, "message": detail})
             run_id = getattr(exc, "run_id", None)
             if isinstance(run_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", run_id):
                 project["apify_run_id"] = run_id
