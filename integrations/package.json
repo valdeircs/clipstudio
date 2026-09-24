@@ -1,0 +1,1 @@
+{"private":true,"description":"Read the existing Apify CLI credential from the OS keychain","dependencies":{"@napi-rs/keyring":"1.3.0"}}

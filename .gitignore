@@ -1,0 +1,28 @@
+# Local project media, credentials and face-detection compilation cache
+/data/
+connections.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local runtimes, downloaded packages and generated Python files
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.cache/
+*.log
+.DS_Store
+
+# No user footage or exports; only the original built-in demonstration ships
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.mp3
+*.wav
+*.srt
+!demo/source.mp4

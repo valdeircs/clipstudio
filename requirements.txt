@@ -1,0 +1,6 @@
+# Core app dependencies, verified in the local development environment.
+Pillow==12.2.0
+yt-dlp[default]==2026.8.19
+youtube-transcript-api==1.2.4
+
+# Install FFmpeg separately. Whisper is optional; see README.md.
