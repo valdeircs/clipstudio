@@ -90,8 +90,8 @@ class ReselectionTests(unittest.TestCase):
         with self.assertRaises(srv.APIError) as error:self.handler.reselect_ai(PID,{})
         self.assertEqual(error.exception.status,409)
         self.assertEqual(len(self.jobs),1)
-    def test_short_source_rejected_without_queue(self):
-        p=srv.read_project(PID);p['duration']=29.99;srv.atomic_json(self.folder/'project.json',p)
+    def test_subsecond_source_rejected_without_queue(self):
+        p=srv.read_project(PID);p['duration']=0.99;srv.atomic_json(self.folder/'project.json',p)
         with self.assertRaises(srv.APIError):self.handler.reselect_ai(PID,{})
         self.assertFalse(self.jobs)
     def test_new_caption_controls_round_trip_and_invalid_values_fail(self):

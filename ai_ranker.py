@@ -18,9 +18,13 @@ DEFAULT_MODELS = {"gemini": "gemini-3.5-flash-lite", "openai": "gpt-4.1-mini"}
 MAX_TRANSCRIPT_CHARS = 200_000
 MAX_DURATION = 7200
 MAX_RESPONSE_BYTES = 2_000_000
+# Retained only for validating saved responses from the legacy window protocol.
+# New analysis uses source unit IDs and MIN_USABLE_CLIP_SECONDS below.
 MIN_CLIP_SECONDS = 30
 MAX_CLIP_SECONDS = 90
 MAX_CANDIDATE_RANGES = 5000
+MIN_USABLE_CLIP_SECONDS = 1
+SELECTION_PROTOCOL = "sentence_units_v2"
 MESSAGE_GOALS = {
     "balanced": "Choose the strongest useful complete ideas with a fair balance of context and payoff.",
     "inspiring": "Prioritize hope, transformation, reconciliation and constructive action. Include the resolution, not just the painful setup.",
@@ -119,6 +123,26 @@ def _schema(count: int, range_count: int) -> dict:
         "properties": {"clips": {"type": "array", "minItems": 1, "maxItems": count,
             "items": {"type": "object", "properties": properties,
                 "required": list(properties), "additionalProperties": False}},
+            "coverage_note": {"type": "string"}},
+        "required": ["clips", "coverage_note"],
+    }
+
+
+def _unit_schema(count: int, unit_count: int) -> dict:
+    """The provider selects source units; source text/times stay authoritative."""
+    properties = {
+        "start_unit": {"type": "integer", "minimum": 0, "maximum": unit_count - 1},
+        "end_unit": {"type": "integer", "minimum": 0, "maximum": unit_count - 1},
+        "title": {"type": "string"}, "reason": {"type": "string"},
+        "start_reason": {"type": "string"}, "end_reason": {"type": "string"},
+        "score": {"type": "number", "minimum": 0, "maximum": 100},
+    }
+    return {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "clips": {"type": "array", "minItems": 1, "maxItems": count,
+                      "items": {"type": "object", "properties": properties,
+                                "required": list(properties), "additionalProperties": False}},
             "coverage_note": {"type": "string"}},
         "required": ["clips", "coverage_note"],
     }
@@ -400,13 +424,67 @@ def _validate_clips(result, segments: list[dict], duration: float, count: int, r
     return distinct
 
 
+def _validate_unit_clips(result, segments: list[dict], duration: float, count: int) -> list[dict]:
+    """Resolve inclusive source IDs without inferred times or copied AI quotes."""
+    invalid = "AI returned invalid clip selections. No clips were selected; try analysis again."
+    if not isinstance(result, dict) or set(result) != {"clips", "coverage_note"}:
+        raise AIRankingError(invalid)
+    candidates, note = result["clips"], result["coverage_note"]
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= count:
+        raise AIRankingError(invalid)
+    if not isinstance(note, str) or len(note) > 1200 or (len(candidates) < count and len(note.strip()) < 40):
+        raise AIRankingError("AI returned fewer options without explaining why. No clips were selected; try analysis again.")
+    fields = {"start_unit", "end_unit", "title", "reason", "start_reason", "end_reason", "score"}
+    clips = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate) != fields:
+            raise AIRankingError(invalid)
+        first, last = candidate["start_unit"], candidate["end_unit"]
+        if type(first) is not int or type(last) is not int or not 0 <= first <= last < len(segments):
+            raise AIRankingError("AI selected invalid or out-of-order source unit IDs. No clips were selected.")
+        source = segments[first:last + 1]
+        start, end = source[0]["start"], max(unit["end"] for unit in source)
+        if (not 0 <= start < end <= duration
+                or round(end - start, 6) < MIN_USABLE_CLIP_SECONDS):
+            raise AIRankingError("AI selected a source interval shorter than one usable second or outside the video.")
+        if source[0].get("start_boundary") == "continuation" or source[-1].get("end_boundary") == "continuation":
+            raise AIRankingError("AI selected a known unfinished sentence boundary. No clips were selected.")
+        text_fields = {}
+        for field, limit in (("title", 120), ("reason", 1000), ("start_reason", 400), ("end_reason", 400)):
+            value = candidate[field]
+            if not isinstance(value, str) or not 1 <= len(value.strip()) <= limit:
+                raise AIRankingError("AI did not provide valid titles and selection explanations. No clips were selected.")
+            text_fields[field] = value.strip()
+        score = _finite_number(candidate["score"], "AI score", 0, 100)
+        selected_text = " ".join(unit["text"] for unit in source)
+        words = selected_text.split()
+        clips.append({
+            **text_fields, "start_unit": first, "end_unit": last,
+            "start": start, "end": end, "range_id": f"w{first}-{last}",
+            "text": selected_text, "opening_quote": " ".join(words[:12]),
+            "closing_quote": " ".join(words[-12:]),
+            "following_context": segments[last + 1]["text"] if last + 1 < len(segments) else "",
+            "score": round(score), "_rank_score": score, "status": "suggested", "analysis": "ai",
+        })
+    clips.sort(key=lambda clip: (-clip["_rank_score"], clip["start"], clip["end"]))
+    distinct = []
+    for clip in clips:
+        if any(max(0, min(clip["end"], other["end"]) - max(clip["start"], other["start"]))
+               / min(clip["end"] - clip["start"], other["end"] - other["start"]) > .15
+               for other in distinct):
+            continue
+        clip.pop("_rank_score", None)
+        clip["id"] = f"clip-{len(distinct) + 1}"
+        distinct.append(clip)
+    return distinct
+
+
 def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -> dict:
     """Select timestamp-grounded clips using only the configured provider.
 
     config keys: ai_provider (gemini/openai), ai_api_key, ai_model (optional).
     request keys: count/clip_count (1–8), message_goal and content_context preset names.
-    Legacy length is validated but is not a target.
-    The model chooses an independent duration of 30–90 seconds for every clip.
+    Legacy length is ignored: the model chooses each complete idea's duration.
     Raises AIRankingError for invalid input, network/API errors or bad output.
     """
     provider = config.get("ai_provider")
@@ -422,13 +500,9 @@ def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", model):
         raise AIRankingError("AI model must be a model name, without a URL or path.")
     duration = _finite_number(duration, "Video duration", 1, MAX_DURATION)
-    # Retain input validation for old callers, without steering editorial cuts to
-    # an obsolete fixed duration. AI independently chooses each clip's length.
-    if "length" in request or "clip_length" in request:
-        _finite_number(request.get("length", request.get("clip_length")), "Clip length", 15, 90)
-    if duration < MIN_CLIP_SECONDS:
-        raise AIRankingError("This video is shorter than the required 30-second minimum clip length.")
-    count_number = _finite_number(request.get("count", request.get("clip_count", 3)), "Clip count", 1, 8)
+    # Old saved settings may contain a fixed length. They do not constrain AI
+    # selection and are never sent to the provider.
+    count_number = _finite_number(request.get("count", request.get("clip_count", 5)), "Clip count", 1, 8)
     if not count_number.is_integer():
         raise AIRankingError("Clip count must be a whole number from 1 to 8.")
     count = int(count_number)
@@ -462,9 +536,9 @@ def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -
         "a reversal, correction, present-day resolution, caveat, answer or moral of the story. "
         "A painful backstory is not complete before an immediate reconciliation or positive "
         "qualification; include the speaker's current perspective when it changes the meaning. "
-        "Extend the ending to preserve such context, adjust the opening to keep the whole moment "
-        "within 90 seconds, or choose another moment. Never omit a qualification for a stronger hook. "
-        "The end_context_flags call attention to possible contrasts or time changes; evaluate their "
+        "Extend the ending as far as needed to preserve such context, even when the resolution "
+        "occurs much later. Never omit a qualification for a stronger hook or to meet a duration target. "
+        "The after_flags call attention to possible contrasts or time changes; evaluate their "
         "meaning, and do the same context check even without a flag. "
         f"OUTPUT LANGUAGE: write title, reason, start_reason, end_reason and coverage_note ONLY in {output_language}. "
         "Do not switch explanations to English just because these instructions are in English. "
@@ -479,27 +553,22 @@ def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -
         "coverage_note must specifically explain the source limitations and why more cannot be "
         "selected safely. Otherwise use an empty coverage_note. Never force poor or misleading clips "
         "just to fill the requested count. "
-        "Choose the best editorial range yourself, independently for each moment. Every supplied "
-        "range already satisfies the hard 30–90 second limit; you do not need to calculate durations. "
-        "There is NO target duration. A complete 38-second idea is better than stretching it to 60, "
-        "and a story needing 84 seconds must not be chopped to 45. Never pad a short idea with unrelated "
-        "material to reach 30 seconds; choose another moment. Do not cut an unfinished thought to meet 90. "
+        "You decide the natural duration of each complete idea. There is NO fixed target, minimum "
+        "editorial length, or maximum clip length. A complete 23-second insight may stand alone; "
+        "a story needing two minutes or more must include its necessary resolution. Aim for concise, "
+        "useful short-form passages: avoid unrelated material or repetition, but do not sacrifice "
+        "meaning to make a clip shorter. Never pad an idea to reach a duration. "
         "The transcript contains timestamp-grounded sentence units, or caption cues when word timing "
         "is unavailable. Boundary labels describe timing evidence, not proof of semantic completeness. "
         "Never start or end at a boundary labeled continuation. With a cue or source boundary, check "
         "the neighboring text especially carefully for a cut sentence or missing context. "
-        "Choose ONLY a string range_id from candidate_ranges, such as w16-31. A range ID starts "
-        "with w and encodes BOTH its first and last unit. A transcript unit number such as 16 is NOT "
-        "a range ID. Do not confuse a unit number with a clip window. "
-        "Each candidate row is [range_id, first_unit, last_unit, "
-        "duration_seconds]. The first and last unit indices are inclusive. A range contains every "
-        "unit between them, with source-grounded start/end timestamps already validated by the app. "
-        "Do not output a bare unit number or timestamps. Never invent a range_id or alter transcript text. "
-        "For every choice, copy the FIRST3–12 source words of that entire selected window into "
-        "opening_quote and the LAST 3–12 source words into closing_quote. Preserve the words exactly; "
-        "only punctuation and capitalization may differ. Use longer exact quotes, up to 40 words, "
-        "if necessary to identify the passage uniquely. Quotes must refer to the same window ID "
-        "as the title and explanations. Do not quote words from another unit or a nearby better idea. "
+        "Each transcript row is [unit_id, start_seconds, end_seconds, start_boundary, end_boundary, "
+        "after_flags, text]. Choose start_unit and end_unit as integer unit_id values from these rows. "
+        "These are inclusive: the clip contains every unit from start_unit through end_unit. "
+        "start_unit must be at most end_unit. Select the actual first and last units of your chosen "
+        "complete passage, including all words in both units. You cannot trim inside a unit. "
+        "The app looks up the exact source times and derives boundary quotes locally. "
+        "Do not output timestamps, range IDs or copied source quotes. "
         "Choose distinct ideas without repeated setups or payoffs. Overlap divided by the shorter clip's duration must not exceed 0.15. "
         "Provide a concise faithful title (at most 120 characters), a specific reason explaining "
         "the hook/payoff/context and any review caveat (at most 1000 characters), and score. "
@@ -508,28 +577,23 @@ def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -
         "the thought. end_reason must also explain why the following context can be excluded without "
         "changing the speaker's meaning; if it cannot, change the selection. Avoid generic explanations; "
         "refer to the selected idea's actual setup, payoff and following context. "
-        "Review the text following the chosen range's last_unit before writing end_reason. "
+        "Review the text following end_unit before writing end_reason. "
         "The app will preserve that following context from the source automatically. "
-        "Before returning, recheck duration, complete opening, full payoff, next-context meaning, "
+        "Before returning, recheck source unit IDs, complete opening, full payoff, next-context meaning, "
         "language and requested option count for every selected clip. Return only the specified JSON object."
     )
-    ranges = _candidate_ranges(prepared, duration)
-    while True:
-        schema = _schema(count, len(ranges))
-        source_json = json.dumps({
-            "duration_seconds": duration, "requested_clip_count": count, "output_language": output_language,
-            "message_goal": message_goal, "content_context": content_context,
-            "min_clip_seconds": MIN_CLIP_SECONDS, "max_clip_seconds": MAX_CLIP_SECONDS,
-            "transcript": prepared,
-            "candidate_ranges": [[f"w{first}-{last}", first, last, round(end - prepared[first]["start"], 3)]
-                                 for first, last, end in ranges],
-        }, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        if len(source_json) + len(json.dumps(schema)) + len(instruction) <= MAX_TRANSCRIPT_CHARS:
-            break
-        reduced = _candidate_ranges(prepared, duration, limit=len(ranges) // 2)
-        if len(reduced) >= len(ranges):
-            raise AIRankingError("The transcript and timing choices are too large for one AI analysis. Use a shorter video.")
-        ranges = reduced
+    schema = _unit_schema(count, len(prepared))
+    source_json = json.dumps({
+        "duration_seconds": duration, "requested_clip_count": count, "output_language": output_language,
+        "message_goal": message_goal, "content_context": content_context,
+        "duration_mode": "ai", "selection_protocol": SELECTION_PROTOCOL,
+        "transcript_columns": ["unit_id", "start_seconds", "end_seconds", "start_boundary", "end_boundary", "after_flags", "text"],
+        "transcript": [[unit["index"], unit["start"], unit["end"], unit["start_boundary"],
+                        unit["end_boundary"], unit.get("end_context_flags", []), unit["text"]]
+                       for unit in prepared],
+    }, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    if len(source_json) + len(json.dumps(schema)) + len(instruction) > MAX_TRANSCRIPT_CHARS:
+        raise AIRankingError("The transcript is too large for one AI analysis. Use a shorter video.")
     if provider == "gemini":
         response = _post_json(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -576,14 +640,14 @@ def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -
             # A detached, redacted snapshot cannot mutate subsequent validation.
             # No configuration, request headers or provider envelopes are saved.
             snapshot = {"selection": selection, "prepared_units": prepared,
-                        "candidate_ranges": ranges, "ai_provider": provider,
+                        "selection_protocol": SELECTION_PROTOCOL, "ai_provider": provider,
                         "model": model, "usage": usage}
             serialized = json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
             observer(json.loads(serialized.replace(json.dumps(key, ensure_ascii=False)[1:-1], "[redacted]")))
         except Exception:
             # Diagnostics must never discard a paid response or start another call.
             pass
-    clips = _validate_clips(selection, prepared, duration, count, ranges)
+    clips = _validate_unit_clips(selection, prepared, duration, count)
     for clip in clips:
         clip.update(message_goal=message_goal, content_context=content_context,
                     zoom_mode="auto", zoom=1, fit="crop")
@@ -591,8 +655,9 @@ def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -
         "clips": clips, "ai_provider": provider, "model": model,
         "coverage_note": selection["coverage_note"].strip(),
         "message_goal": message_goal, "content_context": content_context,
-        "duration_mode": "ai", "min_clip_seconds": MIN_CLIP_SECONDS, "max_clip_seconds": MAX_CLIP_SECONDS,
-        "analysis_method": f"AI selects complete moments of 30–90 seconds using {provider} / {model}, with source-grounded sentence boundaries where timing is available. Scores are editorial suggestions, not virality predictions. Review wording and context before export.",
+        "duration_mode": "ai", "min_clip_seconds": MIN_USABLE_CLIP_SECONDS, "max_clip_seconds": duration,
+        "selection_protocol": SELECTION_PROTOCOL,
+        "analysis_method": f"AI chooses the duration of each complete thought without a fixed target using {provider} / {model}. Cuts use source sentence boundaries where timing is available. Scores are editorial suggestions, not virality predictions. Review wording and context before export.",
     }
     removed = len(selection["clips"]) - len(clips)
     if removed:
@@ -601,12 +666,6 @@ def rank_with_ai(segments: list, duration: float, request: dict, config: dict) -
                    f"Removed {removed} overlapping suggestion(s); {len(clips)} distinct clip(s) remain.")
         result["selection_warning"] = warning
         result["coverage_note"] = " ".join(filter(None, (result["coverage_note"], warning)))
-    recovered = sum(bool(clip.get("boundary_correction")) for clip in clips)
-    if recovered:
-        warning = (f"O tempo de {recovered} corte(s) foi confirmado por correspondência única das citações exatas ao texto de origem."
-                   if language_code == "pt" else
-                   f"Resolved {recovered} clip range ID(s) using unique exact opening and closing source quotes.")
-        result["selection_warning"] = " ".join(filter(None, (result.get("selection_warning"), warning)))
     if usage:
         result["usage"] = usage
     return result

@@ -16,7 +16,7 @@ SEGMENTS = [{"start": i * 10, "end": (i + 1) * 10, "text": f"A complete source p
 KEY = "test-secret-never-display"  # Synthetic redaction marker, not a real credential.
 
 
-def selection(**updates):
+def legacy_selection(**updates):
     first = updates.pop("start_segment", 0)
     last = updates.pop("end_segment", 2)
     ranges = ranker._candidate_ranges(ranker._prepare_segments(SEGMENTS, 120), 120)
@@ -27,6 +27,15 @@ def selection(**updates):
     words = re.findall(r"\w+", source)
     return {"range_id": range_id, "title": "A source idea",
             "opening_quote": " ".join(words[:3]), "closing_quote": " ".join(words[-3:]),
+            "reason": "A clear opening leads into a complete explanation.",
+            "start_reason": "The idea is introduced here.", "end_reason": "The explanation finishes here.",
+            "score": 84, **updates}
+
+
+def selection(**updates):
+    first = updates.pop("start_segment", 0)
+    last = updates.pop("end_segment", 2)
+    return {"start_unit": first, "end_unit": last, "title": "A source idea",
             "reason": "A clear opening leads into a complete explanation.",
             "start_reason": "The idea is introduced here.", "end_reason": "The explanation finishes here.",
             "score": 84, **updates}
@@ -88,9 +97,9 @@ class RankerTest(unittest.TestCase):
         self.assertEqual([c["start"] for c in result["clips"]], [50, 0])
         self.assertEqual([c["id"] for c in result["clips"]], ["clip-1", "clip-2"])
 
-    def test_long_clip_is_rejected(self):
-        with self.assertRaisesRegex(ranker.AIRankingError, "range"):
-            self.run_gemini(gemini_response([selection(end_segment=10)]))
+    def test_long_complete_idea_is_allowed(self):
+        result, _ = self.run_gemini(gemini_response([selection(end_segment=10)]))
+        self.assertEqual(result["clips"][0]["end"], 110)
 
     def test_invalid_json_or_wrong_fields_rejected(self):
         for text in ["not JSON", '{"clips": []}', '{"clips": [], "execute": "evil"}']:
@@ -117,7 +126,7 @@ class RankerTest(unittest.TestCase):
 
     def test_bad_input_does_not_call_api(self):
         with patch.object(ranker, "_post_json") as post:
-            cases = [([], 120, {}), (SEGMENTS, 7201, {}), (SEGMENTS, 120, {"count": 9}), (SEGMENTS, 120, {"length": 3}), (SEGMENTS, 120, {"count": 1.5}), (SEGMENTS, float("inf"), {})]
+            cases = [([], 120, {}), (SEGMENTS, 7201, {}), (SEGMENTS, 120, {"count": 9}), (SEGMENTS, 120, {"message_goal": "invalid"}), (SEGMENTS, 120, {"count": 1.5}), (SEGMENTS, float("inf"), {})]
             for segments, duration, request in cases:
                 with self.subTest(duration=duration, request=request), self.assertRaises(ranker.AIRankingError):
                     ranker.rank_with_ai(segments, duration, request, {"ai_provider": "gemini", "ai_api_key": KEY})
@@ -147,7 +156,7 @@ class RankerTest(unittest.TestCase):
 
     def test_observer_captures_before_invalid_selection_without_credentials(self):
         snapshots = []
-        response = gemini_response([selection(range_id=999999, title=KEY)])
+        response = gemini_response([selection(start_unit=999999, title=KEY)])
         response['usageMetadata']['unsafe_field'] = KEY
         with patch.object(ranker, '_post_json', return_value=response) as post:
             with self.assertRaises(ranker.AIRankingError):
@@ -155,9 +164,9 @@ class RankerTest(unittest.TestCase):
                                     {'ai_provider': 'gemini', 'ai_api_key': KEY})
         self.assertEqual(post.call_count, 1)
         self.assertEqual(len(snapshots), 1)
-        self.assertEqual(set(snapshots[0]), {'selection', 'prepared_units', 'candidate_ranges', 'ai_provider', 'model', 'usage'})
+        self.assertEqual(set(snapshots[0]), {'selection', 'prepared_units', 'selection_protocol', 'ai_provider', 'model', 'usage'})
         self.assertNotIn(KEY, json.dumps(snapshots))
-        self.assertEqual(snapshots[0]['selection']['clips'][0]['range_id'], 999999)
+        self.assertEqual(snapshots[0]['selection']['clips'][0]['start_unit'], 999999)
         self.assertEqual(snapshots[0]['usage']['total_tokens'], 55)
 
     def test_observer_failure_does_not_discard_response_or_retry(self):
@@ -171,7 +180,7 @@ class RankerTest(unittest.TestCase):
 
     def test_observer_snapshot_is_detached_from_validation(self):
         def mutate(snapshot):
-            snapshot['selection']['clips'][0]['range_id'] = 999999
+            snapshot['selection']['clips'][0]['start_unit'] = 999999
             snapshot['prepared_units'][0]['start'] = -100
         with patch.object(ranker, '_post_json', return_value=gemini_response()):
             result = ranker.rank_with_ai(SEGMENTS, 120, {'_response_observer': mutate},
@@ -193,24 +202,87 @@ class RankerTest(unittest.TestCase):
             result, _ = self.run_gemini(gemini_response(candidates))
             self.assertEqual([(c['start'], c['end']) for c in result['clips']], [(0, 30)])
 
-    def test_numeric_unit_id_cannot_be_mistaken_for_window_id(self):
+    def validate_legacy(self, candidate):
+        return ranker._validate_clips({'clips': [candidate], 'coverage_note': ''},
+                                     ranker._prepare_segments(SEGMENTS, 120), 120, 1)
+
+    def test_legacy_numeric_id_cannot_be_mistaken_for_window_id(self):
         with self.assertRaisesRegex(ranker.AIRankingError, 'range outside'):
-            self.run_gemini(gemini_response([selection(range_id=16)]))
+            self.validate_legacy(legacy_selection(range_id=16))
 
-    def test_explicit_window_id_and_normalized_source_quotes(self):
-        result, post = self.run_gemini(gemini_response([selection(
-            opening_quote='A, COMPLETE source', closing_quote='source passage 2!')]))
-        self.assertEqual(result['clips'][0]['range_id'], 'w0-2')
-        self.assertEqual((result['clips'][0]['start'], result['clips'][0]['end']), (0, 30))
-        payload = post.call_args.args[2]
-        source = json.loads(payload['contents'][0]['parts'][0]['text'])
-        self.assertTrue(all(re.fullmatch(r'w[0-9]+-[0-9]+', row[0]) for row in source['candidate_ranges']))
+    def test_legacy_window_id_and_normalized_source_quotes(self):
+        clips = self.validate_legacy(legacy_selection(
+            opening_quote='A, COMPLETE source', closing_quote='source passage 2!'))
+        self.assertEqual(clips[0]['range_id'], 'w0-2')
+        self.assertEqual((clips[0]['start'], clips[0]['end']), (0, 30))
 
-    def test_quotes_from_another_window_are_rejected(self):
+    def test_legacy_quotes_from_another_window_are_rejected(self):
         for changes in ({'opening_quote': 'A complete source passage 5'},
                         {'closing_quote': 'source passage 5'}):
             with self.subTest(changes=changes), self.assertRaisesRegex(ranker.AIRankingError, 'quoted words'):
-                self.run_gemini(gemini_response([selection(**changes)]))
+                self.validate_legacy(legacy_selection(**changes))
+
+    def test_compact_unit_protocol_needs_no_provider_quotes_or_range_enumeration(self):
+        with patch.object(ranker, '_candidate_ranges', side_effect=AssertionError('Legacy enumeration used')):
+            result, post = self.run_gemini()
+        payload = post.call_args.args[2]
+        source = json.loads(payload['contents'][0]['parts'][0]['text'])
+        schema = payload['generationConfig']['responseJsonSchema']
+        fields = schema['properties']['clips']['items']['properties']
+        self.assertEqual(fields['start_unit'], {'type': 'integer', 'minimum': 0, 'maximum': 11})
+        self.assertEqual(fields['end_unit'], fields['start_unit'])
+        self.assertNotIn('opening_quote', fields)
+        self.assertNotIn('closing_quote', fields)
+        self.assertNotIn('candidate_ranges', source)
+        self.assertEqual(source['transcript'][0], [0, 0, 10, 'source_start', 'sentence', [], SEGMENTS[0]['text']])
+        self.assertEqual(source['requested_clip_count'], 5)
+        self.assertEqual(result['min_clip_seconds'], 1)
+        self.assertEqual(result['max_clip_seconds'], 120)
+        self.assertEqual(result['selection_protocol'], 'sentence_units_v2')
+        self.assertIn('without a fixed target', result['analysis_method'])
+
+    def test_23_second_complete_source_is_allowed_and_quotes_are_locally_derived(self):
+        source = [{'start': 0, 'end': 23, 'text': 'A brief, complete insight ends here.'}]
+        result, _ = self.run_gemini(gemini_response([selection(end_segment=0)]),
+                                    segments=source, duration=23, request={'count': 1, 'length': 90})
+        clip = result['clips'][0]
+        self.assertEqual((clip['start'], clip['end']), (0, 23))
+        self.assertEqual(clip['opening_quote'], source[0]['text'])
+        self.assertEqual(clip['closing_quote'], source[0]['text'])
+        self.assertEqual(result['max_clip_seconds'], 23)
+
+    def test_long_resolution_remains_in_the_selected_message(self):
+        source = [{'start': 0, 'end': 23, 'text': 'A difficult beginning.'},
+                  {'start': 23, 'end': 105, 'text': 'The story develops.'},
+                  {'start': 105, 'end': 142, 'text': 'But now reconciliation changes the meaning.'}]
+        result, post = self.run_gemini(gemini_response([selection()]),
+                                      segments=source, duration=142, request={'count': 1, 'length': 30})
+        clip = result['clips'][0]
+        self.assertEqual((clip['start'], clip['end']), (0, 142))
+        self.assertIn(source[-1]['text'], clip['text'])
+        self.assertTrue(clip['closing_quote'].endswith(source[-1]['text']))
+        instruction = post.call_args.args[2]['systemInstruction']['parts'][0]['text']
+        self.assertNotIn('within 90 seconds', instruction)
+        self.assertNotIn('30–90', instruction)
+
+    def test_unfinished_boundary_ids_are_rejected(self):
+        prepared = ranker._prepare_segments(SEGMENTS, 120)
+        for field, index in [('start_boundary', 0), ('end_boundary', 2)]:
+            modified = [dict(unit) for unit in prepared]
+            modified[index][field] = 'continuation'
+            with self.subTest(field=field), self.assertRaisesRegex(ranker.AIRankingError, 'unfinished'):
+                ranker._validate_unit_clips({'clips': [selection()], 'coverage_note': ''}, modified, 120, 1)
+
+    def test_technical_subsecond_interval_is_rejected(self):
+        source = [{'start': 0, 'end': .5, 'text': 'A very brief word.'}]
+        with self.assertRaisesRegex(ranker.AIRankingError, 'one usable second'):
+            self.run_gemini(gemini_response([selection(end_segment=0)]), segments=source, duration=1,
+                            request={'count': 1})
+
+    def test_ai_cannot_override_source_times_or_text(self):
+        for extra in ({'opening_quote': 'Invented quote'}, {'start': 90}, {'range_id': 'w0-2'}):
+            with self.subTest(extra=extra), self.assertRaises(ranker.AIRankingError):
+                self.run_gemini(gemini_response([selection(**extra)]))
 
     def test_redirect_disabled(self):
         self.assertIsNone(ranker._NoRedirect().redirect_request(None, None, 302, None, None, "https://evil.example"))

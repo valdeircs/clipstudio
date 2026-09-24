@@ -159,15 +159,20 @@ def api_config(config=None, *, pipeline: str) -> dict:
     return snapshot
 
 
-def analysis_settings(body: dict) -> dict:
-    length = finite_number(body.get("length", 30), "Clip length")
+def analysis_settings(body: dict, *, ai: bool = False) -> dict:
     count = finite_number(body.get("count", 3), "Clip count")
-    if not 15 <= length <= 90 or not 1 <= count <= 8 or count != int(count):
-        raise APIError("Choose a clip length from 15 to 90 seconds and 1 to 8 clips.")
+    if not 1 <= count <= 8 or count != int(count):
+        raise APIError("Choose between 1 and 8 clips.")
+    timing = {"duration_mode": "ai"}
+    if not ai:
+        length = finite_number(body.get("length", 30), "Clip length")
+        if not 15 <= length <= 90:
+            raise APIError("Choose a local-rules target length from 15 to 90 seconds.")
+        timing = {"length": length}
     language = body.get("language", "auto")
     if not isinstance(language, str) or not re.fullmatch(r"(?:auto|[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?)", language):
         raise APIError("Choose a valid transcription language.")
-    return {"length": length, "count": int(count), "language": language, **selection_preferences(body)}
+    return {**timing, "count": int(count), "language": language, **selection_preferences(body)}
 
 
 def selection_preferences(body: dict) -> dict:
@@ -292,7 +297,7 @@ def reselect_ai_job(project_id: str, request: dict) -> None:
     try:
         from ai_ranker import rank_with_ai
         project = read_project(project_id)
-        progress_callback(project_id, secrets=secrets)("ai", 40, "Gemini is choosing complete moments between 30 and 90 seconds from your saved transcript…")
+        progress_callback(project_id, secrets=secrets)("ai", 40, "Gemini is choosing each complete message and its natural duration from your saved transcript…")
         ai_request = {**request, "_response_observer": lambda response: atomic_json(
             project_folder(project_id) / "ai-selection-response.json", redact(response, secrets))}
         result = rank_with_ai(project["segments"], project["duration"], ai_request, snapshot)
@@ -312,7 +317,7 @@ def reselect_ai_job(project_id: str, request: dict) -> None:
                     "ai_provider": current.get("ai_provider"), "model": current.get("model"),
                 })
             current.update({key: value for key, value in safe_result.items()
-                            if key in {"clips", "ai_provider", "model", "analysis_method", "usage", "duration_mode", "min_clip_seconds", "max_clip_seconds", "coverage_note", "selection_warning", "message_goal", "content_context"}})
+                            if key in {"clips", "ai_provider", "model", "analysis_method", "usage", "duration_mode", "min_clip_seconds", "max_clip_seconds", "coverage_note", "selection_warning", "message_goal", "content_context", "selection_protocol"}})
             preferences = selection_preferences(request)
             current["settings"] = {**current.get("settings", {}), "count": request["count"], "duration_mode": "ai", **preferences}
             if current.get("source_url"):
@@ -320,7 +325,7 @@ def reselect_ai_job(project_id: str, request: dict) -> None:
                 current.setdefault("_request", {}).update(pipeline="local_ai", count=request["count"], **preferences)
             current.pop("_reselect_pending", None)
             current.update(status="ready", error=None, progress={"stage": "ready", "percent": 100,
-                           "message": "AI chose complete 30–90 second moments. Review each opening and ending before export."})
+                           "message": "AI chose each message and its duration. Review each opening and ending before export."})
         update_project(project_id, complete)
     except Exception as exc:
         log_failure(project_id, "AI reselection", secrets)
@@ -592,8 +597,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"upload_id": upload_id, "name": name[:250]}, 201)
 
     def create_project(self, body: dict) -> None:
-        settings = analysis_settings(body)
-        request = {**settings, "pipeline": "local"}
+        config = None
+        pipeline = "local"
+        if body.get("demo") is not True and not body.get("upload_id"):
+            pipeline = body.get("pipeline")
+            if pipeline is None:
+                config = connections().load(resolve_apify=False)
+                pipeline = config.get("pipeline", "local_ai")
+            if not isinstance(pipeline, str) or pipeline not in {"local", "local_ai", "apify_ai"}:
+                raise APIError("Choose local captions with AI, Apify with AI, or local analysis.")
+        settings = analysis_settings(body, ai=pipeline in {"local_ai", "apify_ai"})
+        request = {**settings, "pipeline": pipeline}
         title = "New video"
         source_kind = "youtube"
         if body.get("demo") is True:
@@ -632,14 +646,6 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 raise APIError("Paste a valid YouTube video link.")
             request["url"] = url.strip()
-            config = None
-            pipeline = body.get("pipeline")
-            if pipeline is None:
-                config = connections().load(resolve_apify=False)
-                pipeline = config.get("pipeline", "local_ai")
-            if not isinstance(pipeline, str) or pipeline not in {"local", "local_ai", "apify_ai"}:
-                raise APIError("Choose local captions with AI, Apify with AI, or local analysis.")
-            request["pipeline"] = pipeline
             if pipeline in {"local_ai", "apify_ai"}:
                 request["_api_config"] = api_config(config if pipeline == "local_ai" else None, pipeline=pipeline)
         project_id = uuid.uuid4().hex
@@ -662,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
             pipeline = project.get("pipeline", original.get("pipeline", "local"))
             if "pipeline" in body and body["pipeline"] != pipeline:
                 raise APIError("Reanalysis uses this project's existing pipeline. Create a new project to change pipelines.")
-            settings = analysis_settings({**project.get("settings", {}), **{key: value for key, value in body.items() if key in {"length", "count", "language", "message_goal", "content_context"}}})
+            settings = analysis_settings({**project.get("settings", {}), **{key: value for key, value in body.items() if key in {"length", "count", "language", "message_goal", "content_context"}}}, ai=pipeline in {"local_ai", "apify_ai"})
             request = {**{key: value for key, value in original.items() if key in REQUEST_FIELDS}, **settings, "pipeline": pipeline}
             source_url = request.get("url") or project.get("source_url")
             if source_url:
@@ -702,8 +708,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise APIError("This project already has a job running. Wait for it to finish.", 409)
             if not isinstance(project.get("segments"), list) or not project["segments"]:
                 raise APIError("This project needs a transcript before AI can select its moments.", 409)
-            if finite_number(project.get("duration", 0), "Video duration") < 30:
-                raise APIError("The source must be at least 30 seconds long for AI selection.")
+            if finite_number(project.get("duration", 0), "Video duration") < 1:
+                raise APIError("The source must be at least one second long for AI selection.")
             config = api_config(pipeline="local_ai")
             preferences = selection_preferences({**project.get("settings", {}), **{key: value for key, value in body.items() if key in {"message_goal", "content_context"}}})
             request = {"count": int(count), "language": project.get("language", "auto"), "_api_config": config, **preferences}
@@ -731,10 +737,10 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 start = finite_number(options.get("start", clip.get("start", 0)), "Start time")
                 end = finite_number(options.get("end", clip.get("end", 0)), "End time")
-                if start < 0 or end - start < 1 or end - start > 90:
-                    raise APIError("Choose a clip range from 1 to 90 seconds.")
-                duration = project.get("duration")
-                if isinstance(duration, (int, float)) and end > duration + 0.1:
+                if start < 0 or end - start < 1:
+                    raise APIError("Choose a clip range of at least one second within the source video.")
+                duration = finite_number(project.get("duration"), "Video duration")
+                if end > duration:
                     raise APIError("The clip cannot extend past the end of the source video.")
                 clip.update(start=start, end=end, duration=round(end - start, 3), status="queued", reviewed=True, error=None)
                 if "title" in options:

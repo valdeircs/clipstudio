@@ -891,8 +891,8 @@ def render_clip(folder: Path, project: dict, clip: dict, options: dict, progress
     duration = _number(project.get("duration"), 0, .1, MAX_DURATION, "Source duration")
     start = _number(options.get("start", clip.get("start")), 0, 0, duration, "Start time")
     end = _number(options.get("end", clip.get("end")), duration, 0, duration, "End time")
-    if not 1 <= end - start <= 90.01:
-        raise VideoError("Export clips must be between 1 and 90 seconds long.")
+    if end - start < 1:
+        raise VideoError("Export clips must be at least one second long and stay within the source video.")
     quality = str(options.get("quality", "720")).replace("p", "")
     if quality not in {"720", "1080"}:
         raise VideoError("Choose 720p or 1080p export quality.")
@@ -948,7 +948,7 @@ def render_clip(folder: Path, project: dict, clip: dict, options: dict, progress
             filters += ";[base]format=yuv420p[out]"
         args += ["-filter_complex_threads", "1", "-filter_complex", filters, "-map", "[out]", "-map", "0:a?", "-t", f"{end - start:.3f}", "-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(work / "video.mp4")]
         progress("render", 25, "Encoding your vertical video with local FFmpeg…")
-        _run(args, folder, timeout=1800, failure="The clip could not be rendered. Try 720p quality or a shorter selection.")
+        _run(args, folder, timeout=max(1800, math.ceil((end - start) * 6)), failure="The clip could not be rendered. Try 720p quality or a shorter selection.")
         progress("thumbnail", 88, "Creating a portrait cover from your video…")
         _thumbnail(folder, work, source, start, end - start, title, width, height, framing["position"], framing["fit"], work / "thumbnail.png", framing["zoom"], framing["vertical_position"])
         _probe(work / "video.mp4")
